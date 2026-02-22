@@ -1,0 +1,347 @@
+name: Build and Package Termii Application
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # build the windows NSIS installer.
+  build:
+    name: Build Windows Installer
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Extract version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "//;s/"//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage installer files
+        shell: bash
+        run: |
+          mkdir -p installer/dist
+          cp target/x86_64-pc-windows-msvc/release/termii.exe installer/dist/
+
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+
+      - name: Compile NSIS installer
+        working-directory: installer
+        shell: bash
+        run: |
+          "/c/Program Files (x86)/NSIS/makensis.exe" \
+            /DAPP_VERSION=${{ steps.version.outputs.VERSION }} \
+            termii.nsi
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termii-installer-windows-${{ steps.version.outputs.VERSION }}
+          path: installer/termii-setup-${{ steps.version.outputs.VERSION }}.exe
+          if-no-files-found: error
+
+  # build the deb file installer
+  build-linux:
+    name: Build Linux Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            pkg-config \
+            libpango1.0-dev \
+            libglib2.0-dev \
+            libatk1.0-dev \
+            libgdk-pixbuf2.0-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "//;s/"//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Create .deb package
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          DEB_DIR="termii_${VERSION}_amd64"
+
+          mkdir -p "${DEB_DIR}/DEBIAN"
+          mkdir -p "${DEB_DIR}/usr/bin"
+          mkdir -p "${DEB_DIR}/usr/share/applications"
+
+          cp target/x86_64-unknown-linux-gnu/release/termii "${DEB_DIR}/usr/bin/termii"
+          chmod 755 "${DEB_DIR}/usr/bin/termii"
+
+          # control file — dpkg reads this for package metadata and version
+          cat > "${DEB_DIR}/DEBIAN/control" << EOF
+          Package: termii
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: Channing Babb
+          Description: Termii SSH Terminal Application
+           A terminal emulator with SSH support.
+          EOF
+
+          # preinst script — runs before files are placed on disk.
+          # dpkg -i allows downgrades by default; this blocks them explicitly.
+          cat > "${DEB_DIR}/DEBIAN/preinst" << EOF
+          #!/bin/bash
+          set -e
+
+          NEW_VERSION="${VERSION}"
+
+          # \$1 = "upgrade" and \$2 = old version when dpkg is replacing an existing install
+          case "\$1" in
+              install|upgrade)
+                  if [ -n "\$2" ]; then
+                      if dpkg --compare-versions "\${NEW_VERSION}" lt "\$2"; then
+                          echo "Error: Cannot downgrade Termii from \$2 to \${NEW_VERSION}." >&2
+                          echo "Download a newer installer to upgrade." >&2
+                          exit 1
+                      fi
+                  fi
+                  ;;
+          esac
+
+          exit 0
+          EOF
+          chmod 755 "${DEB_DIR}/DEBIAN/preinst"
+
+          cat > "${DEB_DIR}/usr/share/applications/termii.desktop" << EOF
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Termii
+          Comment=SSH Terminal
+          Exec=/usr/bin/termii
+          Terminal=false
+          Categories=Network;System;
+          EOF
+
+          dpkg-deb --build "${DEB_DIR}" "termii-setup-${VERSION}-linux-amd64.deb"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termii-installer-linux-${{ steps.version.outputs.VERSION }}
+          path: termii-setup-${{ steps.version.outputs.VERSION }}-linux-amd64.deb
+          if-no-files-found: error
+
+  # build the macos installer
+  build-macos:
+    name: Build macOS Installer
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "//;s/"//')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build release binaries (Intel + Apple Silicon)
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Create universal .app bundle and .pkg installer
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+
+          # Merge Intel + Apple Silicon into a single universal binary
+          lipo -create \
+            target/x86_64-apple-darwin/release/termii \
+            target/aarch64-apple-darwin/release/termii \
+            -output termii_universal
+
+          # Assemble the .app bundle
+          APP="Termii.app"
+          mkdir -p "${APP}/Contents/MacOS"
+          cp termii_universal "${APP}/Contents/MacOS/termii"
+          chmod 755 "${APP}/Contents/MacOS/termii"
+
+          cat > "${APP}/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+              "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>termii</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.channingbabb.termii</string>
+              <key>CFBundleName</key>
+              <string>Termii</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # preinstall script — called by macOS Installer before placing files.
+          # Reads the version from any existing Termii.app's Info.plist and
+          # aborts (exit 1) if this installer is older, blocking downgrades.
+          mkdir -p pkg_scripts
+          cat > pkg_scripts/preinstall << EOF
+          #!/bin/bash
+          set -e
+
+          NEW_VERSION="${VERSION}"
+          APP_PLIST="/Applications/Termii.app/Contents/Info.plist"
+
+          # Nothing installed yet — allow fresh install
+          [ -f "\${APP_PLIST}" ] || exit 0
+
+          INSTALLED=\$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "\${APP_PLIST}" 2>/dev/null || true)
+
+          [ -z "\${INSTALLED}" ] && exit 0
+
+          # Compare using Python 3 (built into macOS): exit 1 if downgrading
+          if ! /usr/bin/python3 -c "
+          import sys
+          a = tuple(int(x) for x in '\${NEW_VERSION}'.split('.'))
+          b = tuple(int(x) for x in '\${INSTALLED}'.split('.'))
+          sys.exit(0 if a >= b else 1)
+          "; then
+              echo "Error: Termii \${INSTALLED} is already installed." >&2
+              echo "Cannot downgrade to ${VERSION}. Download a newer installer." >&2
+              exit 1
+          fi
+
+          exit 0
+          EOF
+          chmod 755 pkg_scripts/preinstall
+
+          # Stage payload: pkgbuild installs everything under --root
+          # relative to --install-location (/Applications)
+          mkdir -p payload
+          cp -r "${APP}" payload/
+
+          # Build the .pkg installer
+          pkgbuild \
+            --root payload \
+            --identifier com.channingbabb.termii \
+            --version "${VERSION}" \
+            --install-location /Applications \
+            --scripts pkg_scripts \
+            "termii-setup-${VERSION}-macos.pkg"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termii-installer-macos-${{ steps.version.outputs.VERSION }}
+          path: termii-setup-${{ steps.version.outputs.VERSION }}-macos.pkg
+          if-no-files-found: error
+
+  # ─── Release: collect all three artifacts and publish ────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: termii-installer-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

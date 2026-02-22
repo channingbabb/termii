@@ -4,3 +4,7 @@
 /target_ci
 /target-test
 /target_test
+
+# Installer build artifacts
+/installer/dist/
+/installer/*.exe
